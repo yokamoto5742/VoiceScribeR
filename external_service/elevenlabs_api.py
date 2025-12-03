@@ -1,9 +1,12 @@
+import asyncio
 import configparser
+import json
 import logging
 import os
 import traceback
-from typing import Optional
+from typing import Any, AsyncGenerator, Optional
 
+import websockets
 from elevenlabs.client import ElevenLabs
 
 from utils.env_loader import load_env_variables
@@ -65,7 +68,10 @@ def transcribe_audio(
 ) -> Optional[str]:
     is_valid, error_msg = validate_audio_file(audio_file_path)
     if not is_valid:
-        logging.warning(error_msg) if "未指定" in error_msg else logging.error(error_msg)
+        if error_msg and "未指定" in error_msg:
+            logging.warning(error_msg)
+        elif error_msg:
+            logging.error(error_msg)
         return None
 
     try:
@@ -109,3 +115,125 @@ def transcribe_audio(
         logging.error(f"エラーのタイプ: {type(e).__name__}")
         logging.debug(f"詳細: {traceback.format_exc()}")
         return None
+
+
+class ElevenLabsRealtimeClient:
+    """ElevenLabs Scribe V2 リアルタイムAPI用WebSocketクライアント"""
+
+    WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/speech-to-text/scribe-v2/real-time"
+
+    def __init__(self, api_key: str, model: str = "scribe_v2", language: str = "jpn"):
+        self.api_key = api_key
+        self.model = model
+        self.language = language
+        self.websocket: Any = None
+        self._is_connected = False
+        self._audio_queue: asyncio.Queue = asyncio.Queue()
+        self._stop_flag = False
+
+    async def connect(self) -> bool:
+        """WebSocket接続を確立"""
+        try:
+            logging.info(f"WebSocket接続開始: {self.WEBSOCKET_URL}")
+
+            # APIキーをヘッダーに含めて接続
+            self.websocket = await websockets.connect(
+                self.WEBSOCKET_URL,
+                additional_headers=[("xi-api-key", self.api_key)],
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+            if not self.websocket:
+                raise ConnectionError("WebSocket接続の確立に失敗しました")
+
+            logging.info("WebSocket接続成功")
+
+            # 初期設定を送信
+            config_message = {
+                "model": self.model,
+                "language": self.language
+            }
+            await self.websocket.send(json.dumps(config_message))
+            logging.info(f"初期設定送信完了: {config_message}")
+
+            self._is_connected = True
+            return True
+
+        except Exception as e:
+            logging.error(f"WebSocket接続エラー: {str(e)}")
+            logging.debug(f"詳細: {traceback.format_exc()}")
+            return False
+
+    async def disconnect(self):
+        """WebSocket接続を切断"""
+        self._stop_flag = True
+        if self.websocket:
+            try:
+                await self.websocket.close()
+                logging.info("WebSocket接続を切断しました")
+            except Exception as e:
+                logging.error(f"WebSocket切断エラー: {str(e)}")
+            finally:
+                self._is_connected = False
+                self.websocket = None
+
+    def is_connected(self) -> bool:
+        """接続状態を確認"""
+        return self._is_connected and self.websocket is not None
+
+    async def send_audio_chunk(self, audio_data: bytes):
+        """音声チャンクを送信"""
+        if not self.is_connected() or not self.websocket:
+            logging.warning("WebSocketが接続されていません")
+            return
+
+        try:
+            await self.websocket.send(audio_data)
+            logging.debug(f"音声チャンク送信: {len(audio_data)} bytes")
+        except Exception as e:
+            logging.error(f"音声チャンク送信エラー: {str(e)}")
+            logging.debug(f"詳細: {traceback.format_exc()}")
+
+    async def receive_text(self) -> AsyncGenerator[tuple[str, bool], None]:
+        """テキスト結果を受信
+
+        Yields:
+            tuple[str, bool]: (テキスト, is_final)
+        """
+        if not self.is_connected() or not self.websocket:
+            logging.error("WebSocketが接続されていません")
+            return
+
+        try:
+            async for message in self.websocket:
+                if self._stop_flag:
+                    break
+
+                try:
+                    data = json.loads(message)
+
+                    # partial結果
+                    if "partial" in data:
+                        text = data["partial"]
+                        logging.debug(f"部分結果: {text}")
+                        yield (text, False)
+
+                    # final結果
+                    elif "final" in data:
+                        text = data["final"]
+                        logging.info(f"確定結果: {text}")
+                        yield (text, True)
+
+                    # エラーメッセージ
+                    elif "error" in data:
+                        error_msg = data["error"]
+                        logging.error(f"APIエラー: {error_msg}")
+
+                except json.JSONDecodeError as e:
+                    logging.error(f"JSONデコードエラー: {str(e)}")
+                    continue
+
+        except Exception as e:
+            logging.error(f"テキスト受信エラー: {str(e)}")
+            logging.debug(f"詳細: {traceback.format_exc()}")

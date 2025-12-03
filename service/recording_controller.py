@@ -1,3 +1,4 @@
+import asyncio
 import configparser
 import glob
 import logging
@@ -9,10 +10,11 @@ import tkinter as tk
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from external_service.elevenlabs_api import transcribe_audio
+from external_service.elevenlabs_api import ElevenLabsRealtimeClient, transcribe_audio
 from service.audio_recorder import save_audio
 from service.text_processing import copy_and_paste_transcription, process_punctuation
 from utils.config_manager import get_config_value
+from utils.env_loader import load_env_variables
 
 
 class RecordingController:
@@ -52,6 +54,14 @@ class RecordingController:
         self._ui_queue: queue.Queue = queue.Queue()
         self._ui_lock = threading.Lock()
         self._is_shutting_down = False
+
+        # リアルタイムAPI用
+        self._use_realtime_api: bool = get_config_value(config, 'ELEVENLABS', 'USE_REALTIME_API', False)
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=100)
+        self._realtime_client: Optional[ElevenLabsRealtimeClient] = None
+        self._websocket_thread: Optional[threading.Thread] = None
+        self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._accumulated_text: str = ""
 
         os.makedirs(self.temp_dir, exist_ok=True)
         self._cleanup_temp_files()
@@ -156,11 +166,25 @@ class RecordingController:
             raise RuntimeError("前回の処理が完了していません")
 
         self.cancel_processing = False
+        self._accumulated_text = ""
+
+        # リアルタイムAPIを使用する場合はaudio_queueをレコーダーに設定
+        if self._use_realtime_api:
+            self.recorder.audio_queue = self._audio_queue
+
         self.recorder.start_recording()
         self.ui_callbacks['update_record_button'](True)
-        self.ui_callbacks['update_status_label'](
-            f"音声入力中... ({self.config['KEYS']['TOGGLE_RECORDING']}キーで停止)"
-        )
+
+        if self._use_realtime_api:
+            self.ui_callbacks['update_status_label'](
+                f"リアルタイム音声入力中... ({self.config['KEYS']['TOGGLE_RECORDING']}キーで停止)"
+            )
+            # WebSocketスレッドを開始
+            self._start_websocket_thread()
+        else:
+            self.ui_callbacks['update_status_label'](
+                f"音声入力中... ({self.config['KEYS']['TOGGLE_RECORDING']}キーで停止)"
+            )
 
         recording_thread = threading.Thread(target=self._safe_record, daemon=False)
         recording_thread.start()
@@ -221,17 +245,36 @@ class RecordingController:
             logging.info(f"音声データを取得しました")
 
             self.ui_callbacks['update_record_button'](False)
-            self.ui_callbacks['update_status_label']("テキスト出力中...")
 
-            self.processing_thread = threading.Thread(
-                target=self.transcribe_audio_frames,
-                args=(frames, sample_rate),
-                daemon=False
-            )
-            self.processing_thread.start()
+            if self._use_realtime_api:
+                # リアルタイムAPI使用時は、WebSocketスレッドの完了を待つ
+                self.ui_callbacks['update_status_label']("リアルタイム文字起こし完了待機中...")
 
-            if self._is_ui_valid():
-                self.master.after(100, self._check_process_thread, self.processing_thread)
+                if self._websocket_thread and self._websocket_thread.is_alive():
+                    logging.info("WebSocketスレッドの完了を待機中...")
+                    self._websocket_thread.join(timeout=10.0)
+
+                    if self._websocket_thread.is_alive():
+                        logging.warning("WebSocketスレッドの待機がタイムアウトしました")
+
+                # 既にリアルタイムでテキストが処理されているので、追加処理は不要
+                self.ui_callbacks['update_status_label'](
+                    f"{self.config['KEYS']['TOGGLE_RECORDING']}キーで音声入力開始/停止"
+                )
+            else:
+                # 従来のバッチ処理
+                self.ui_callbacks['update_status_label']("テキスト出力中...")
+
+                self.processing_thread = threading.Thread(
+                    target=self.transcribe_audio_frames,
+                    args=(frames, sample_rate),
+                    daemon=False
+                )
+                self.processing_thread.start()
+
+                if self._is_ui_valid():
+                    self.master.after(100, self._check_process_thread, self.processing_thread)
+
         except Exception as e:
             logging.error(f"録音停止処理中にエラー: {str(e)}")
             self._safe_error_handler(f"録音停止処理中にエラー: {str(e)}")
@@ -395,6 +438,118 @@ class RecordingController:
             logging.debug(f"詳細: {traceback.format_exc()}")
             self._schedule_ui_callback(self._safe_error_handler, f"コピー&ペースト中にエラー: {str(e)}")
 
+    def _run_asyncio_loop(self, loop: asyncio.AbstractEventLoop):
+        """別スレッドでasyncioイベントループを実行"""
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_forever()
+        except Exception as e:
+            logging.error(f"asyncioループ実行中にエラー: {str(e)}")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    async def _websocket_send_audio(self):
+        """音声Queueからデータを取得してWebSocketに送信"""
+        try:
+            while self.recorder.is_recording and self._realtime_client and self._realtime_client.is_connected():
+                try:
+                    audio_data = await asyncio.get_event_loop().run_in_executor(
+                        None, self._audio_queue.get, True, 0.1
+                    )
+                    await self._realtime_client.send_audio_chunk(audio_data)
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logging.error(f"音声送信中にエラー: {str(e)}")
+                    break
+
+            logging.info("音声送信完了")
+        except Exception as e:
+            logging.error(f"音声送信処理中にエラー: {str(e)}")
+
+    async def _websocket_receive_text(self):
+        """WebSocketからテキストを受信してUIに反映"""
+        try:
+            if not self._realtime_client:
+                return
+
+            async for text, is_final in self._realtime_client.receive_text():
+                if is_final and text:
+                    # 確定テキストのみを処理
+                    logging.info(f"確定テキスト受信: {text}")
+                    processed_text = process_punctuation(text, self.use_punctuation)
+                    self._accumulated_text += processed_text
+
+                    # テキスト置換とUIへの反映
+                    try:
+                        self.master.after(0, self._safe_ui_update, processed_text)
+                    except Exception as e:
+                        logging.error(f"UI更新スケジュール中にエラー: {str(e)}")
+
+            logging.info("テキスト受信完了")
+        except Exception as e:
+            logging.error(f"テキスト受信処理中にエラー: {str(e)}")
+
+    async def _start_realtime_transcription(self):
+        """リアルタイム文字起こしを開始"""
+        try:
+            env_vars = load_env_variables()
+            api_key = env_vars.get("ELEVENLABS_API_KEY")
+            if not api_key:
+                raise ValueError("ELEVENLABS_API_KEYが未設定です")
+
+            self._realtime_client = ElevenLabsRealtimeClient(
+                api_key=api_key,
+                model=self.config['ELEVENLABS']['MODEL'],
+                language=self.config['ELEVENLABS']['LANGUAGE']
+            )
+
+            # WebSocket接続
+            connected = await self._realtime_client.connect()
+            if not connected:
+                raise ConnectionError("WebSocket接続に失敗しました")
+
+            logging.info("WebSocket接続成功")
+
+            # 音声送信とテキスト受信を並行実行
+            await asyncio.gather(
+                self._websocket_send_audio(),
+                self._websocket_receive_text()
+            )
+
+        except Exception as e:
+            logging.error(f"リアルタイム文字起こし中にエラー: {str(e)}")
+            import traceback
+            logging.debug(f"詳細: {traceback.format_exc()}")
+            try:
+                self.master.after(0, self._safe_error_handler, f"リアルタイム文字起こし中にエラー: {str(e)}")
+            except Exception:
+                pass
+        finally:
+            if self._realtime_client:
+                await self._realtime_client.disconnect()
+
+    def _start_websocket_thread(self):
+        """WebSocketスレッドを開始"""
+        try:
+            self._asyncio_loop = asyncio.new_event_loop()
+
+            def run_loop():
+                if self._asyncio_loop:
+                    asyncio.set_event_loop(self._asyncio_loop)
+                    self._asyncio_loop.run_until_complete(self._start_realtime_transcription())
+
+            self._websocket_thread = threading.Thread(target=run_loop, daemon=False)
+            self._websocket_thread.start()
+            logging.info("WebSocketスレッド開始")
+        except Exception as e:
+            logging.error(f"WebSocketスレッド開始中にエラー: {str(e)}")
+            import traceback
+            logging.debug(f"詳細: {traceback.format_exc()}")
+
     def cleanup(self):
         try:
             logging.info("RecordingController クリーンアップ開始")
@@ -403,6 +558,20 @@ class RecordingController:
 
             if self.recorder.is_recording:
                 self.stop_recording()
+
+            # WebSocketスレッドのクリーンアップ
+            if self._websocket_thread and self._websocket_thread.is_alive():
+                logging.info("WebSocketスレッドの完了を待機中...")
+                if self._asyncio_loop and not self._asyncio_loop.is_closed():
+                    try:
+                        self._asyncio_loop.call_soon_threadsafe(self._asyncio_loop.stop)
+                    except Exception as e:
+                        logging.error(f"asyncioループ停止中にエラー: {str(e)}")
+
+                self._websocket_thread.join(timeout=5.0)
+
+                if self._websocket_thread.is_alive():
+                    logging.warning("WebSocketスレッドが強制終了されました")
 
             if self.processing_thread and self.processing_thread.is_alive():
                 logging.info("処理スレッドの完了を待機中...")

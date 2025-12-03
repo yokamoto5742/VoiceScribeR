@@ -1,15 +1,16 @@
 import configparser
 import logging
 import os
+import queue
 import wave
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import pyaudio
 
 
 class AudioRecorder:
-    def __init__(self, config: configparser.ConfigParser):
+    def __init__(self, config: configparser.ConfigParser, audio_queue: Optional[queue.Queue] = None):
         self.sample_rate = int(config['AUDIO']['SAMPLE_RATE'])
         self.channels = int(config['AUDIO']['CHANNELS'])
         self.chunk = int(config['AUDIO']['CHUNK'])
@@ -18,6 +19,7 @@ class AudioRecorder:
         self.is_recording = False
         self.p: Optional[pyaudio.PyAudio] = None
         self.stream: Optional[pyaudio.Stream] = None
+        self.audio_queue = audio_queue
 
         os.makedirs(self.temp_dir, exist_ok=True)
 
@@ -64,6 +66,14 @@ class AudioRecorder:
                     raise AttributeError("ストリームが初期化されていません")
                 data = self.stream.read(self.chunk)
                 self.frames.append(data)
+
+                # Queueが設定されている場合はストリーミング用に音声データを送信
+                if self.audio_queue is not None:
+                    try:
+                        self.audio_queue.put_nowait(data)
+                    except queue.Full:
+                        self.logger.warning("音声Queueが満杯です")
+
             except AttributeError:
                 self.logger.error(f"音声入力中にストリーム初期化エラーが発生しました")
                 raise
