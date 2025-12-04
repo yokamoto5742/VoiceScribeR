@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import traceback
+import base64
 from typing import Any, AsyncGenerator, Optional
 
 import websockets
@@ -134,12 +135,17 @@ class ElevenLabsRealtimeClient:
     async def connect(self) -> bool:
         """WebSocket接続を確立"""
         try:
-            logging.info(f"WebSocket接続開始: {self.WEBSOCKET_URL}")
+            # APIキーの簡易チェック（ログにはマスクして出力）
+            masked_key = f"{self.api_key[:4]}****{self.api_key[-4:]}" if self.api_key and len(
+                self.api_key) > 8 else "INVALID"
+            logging.info(f"WebSocket接続開始: URL={self.WEBSOCKET_URL}, API_KEY={masked_key}")
 
-            # APIキーをヘッダーに含めて接続
+            # 修正: extra_headers -> additional_headers に変更
             self.websocket = await websockets.connect(
                 self.WEBSOCKET_URL,
-                additional_headers=[("xi-api-key", self.api_key)],
+                additional_headers={
+                    "xi-api-key": self.api_key
+                },
                 ping_interval=20,
                 ping_timeout=10
             )
@@ -150,9 +156,14 @@ class ElevenLabsRealtimeClient:
             logging.info("WebSocket接続成功")
 
             # 初期設定を送信
+            # Scribe V2用の初期化メッセージ
             config_message = {
-                "model": self.model,
-                "language": self.language
+                "type": "start",
+                "model": "scribe_v2",  # config.iniの値に関わらず正しいモデルIDを指定
+                "language": self.language,
+                # AudioRecorderの設定(16kHz, 1ch, 16bit PCM)に合わせる
+                "audio_encoding": "pcm_s16le",
+                "sample_rate": 16000
             }
             await self.websocket.send(json.dumps(config_message))
             logging.info(f"初期設定送信完了: {config_message}")
@@ -160,6 +171,12 @@ class ElevenLabsRealtimeClient:
             self._is_connected = True
             return True
 
+        except websockets.exceptions.InvalidStatus as e:
+            # 403 ForbiddenなどのHTTPエラー処理
+            logging.error(f"WebSocket接続拒否 (HTTP {e.response.status_code}): {str(e)}")
+            if e.response.status_code == 403:
+                logging.error("認証エラー: APIキーが無効か、Scribe V2へのアクセス権限がありません。")
+            return False
         except Exception as e:
             logging.error(f"WebSocket接続エラー: {str(e)}")
             logging.debug(f"詳細: {traceback.format_exc()}")
@@ -185,15 +202,23 @@ class ElevenLabsRealtimeClient:
     async def send_audio_chunk(self, audio_data: bytes):
         """音声チャンクを送信"""
         if not self.is_connected() or not self.websocket:
-            logging.warning("WebSocketが接続されていません")
+            # 接続切れの場合はログを出してスキップ
             return
 
         try:
-            await self.websocket.send(audio_data)
-            logging.debug(f"音声チャンク送信: {len(audio_data)} bytes")
+            # 音声データはJSON形式でBase64エンコードして送信
+            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
+            message = {
+                "audio_event": {
+                    "audio_base_64": audio_base64,
+                }
+            }
+            await self.websocket.send(json.dumps(message))
+
         except Exception as e:
             logging.error(f"音声チャンク送信エラー: {str(e)}")
-            logging.debug(f"詳細: {traceback.format_exc()}")
+            self._is_connected = False
 
     async def receive_text(self) -> AsyncGenerator[tuple[str, bool], None]:
         """テキスト結果を受信
@@ -213,21 +238,27 @@ class ElevenLabsRealtimeClient:
                 try:
                     data = json.loads(message)
 
-                    # partial結果
-                    if "partial" in data:
-                        text = data["partial"]
-                        logging.debug(f"部分結果: {text}")
-                        yield (text, False)
+                    event_type = data.get("type")
 
-                    # final結果
-                    elif "final" in data:
-                        text = data["final"]
-                        logging.info(f"確定結果: {text}")
-                        yield (text, True)
+                    if event_type == "transcription":
+                        transcription = data.get("transcription_event", {})
+                        text = transcription.get("text", "")
+                        result_type = transcription.get("type", "")
 
-                    # エラーメッセージ
-                    elif "error" in data:
-                        error_msg = data["error"]
+                        # 空文字は無視
+                        if not text:
+                            continue
+
+                        if result_type == "partial":
+                            # 部分結果はデバッグログのみ
+                            logging.debug(f"部分結果: {text}")
+                            yield (text, False)
+                        elif result_type == "final":
+                            logging.info(f"確定結果: {text}")
+                            yield (text, True)
+
+                    elif event_type == "error":
+                        error_msg = data.get("description", "Unknown error")
                         logging.error(f"APIエラー: {error_msg}")
 
                 except json.JSONDecodeError as e:
@@ -237,3 +268,4 @@ class ElevenLabsRealtimeClient:
         except Exception as e:
             logging.error(f"テキスト受信エラー: {str(e)}")
             logging.debug(f"詳細: {traceback.format_exc()}")
+            self._is_connected = False
