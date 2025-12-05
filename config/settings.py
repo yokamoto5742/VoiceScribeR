@@ -23,6 +23,7 @@ class RealtimeApiSettings(BaseSettings):
 
     model: str = Field(default="scribe_v2_realtime", description="モデル名")
     language: str = Field(default="jpn", description="言語コード")
+    audio_format: str = Field(default="pcm_16000", description="音声フォーマット")
     vad_silence_threshold: float = Field(
         default=0.5, description="VAD無音判定閾値"
     )

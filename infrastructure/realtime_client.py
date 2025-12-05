@@ -253,9 +253,10 @@ class RealtimeTranscriptionClient(QObject):
 
     def _build_websocket_url(self) -> str:
         """WebSocket URL を構築"""
-        base_url = "wss://api.elevenlabs.io/v1/scribe"
+        base_url = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
         params = [
-            f"model={self._settings.model}",
-            f"language={self._settings.language}",
+            f"model_id={self._settings.model}",
+            f"audio_format={self._settings.audio_format}",
+            f"language_code={self._settings.language}",
         ]
         return f"{base_url}?{'&'.join(params)}"
