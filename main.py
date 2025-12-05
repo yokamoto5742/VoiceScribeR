@@ -1,172 +1,180 @@
-import logging
-import os
-import sys
-import tkinter as tk
-import traceback
-from tkinter import messagebox
+"""VoiceScribe v2.0 メインエントリポイント"""
 
-from app import __version__
-from app.main_window import VoiceInputManager
-from external_service.elevenlabs_api import setup_elevenlabs_client
-from service.audio_recorder import AudioRecorder
-from service.text_processing import initialize_text_processing, load_replacements
-from utils.config_manager import load_config
-from utils.log_rotation import setup_logging, setup_debug_logging
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+from PyQt6.QtWidgets import QApplication, QMessageBox
+
+from application.clipboard_manager import ClipboardManager
+from application.orchestrator import TranscriptionOrchestrator
+from application.text_processor import TextPostProcessor
+from config.settings import AppSettings
+from infrastructure.audio_recorder import AudioRecorderWorker
+from infrastructure.keyboard_listener import GlobalHotkeyManager
+from infrastructure.realtime_client import RealtimeTranscriptionClient
+from presentation.dialogs.settings_dialog import SettingsDialog
+from presentation.main_window import MainWindow
+from presentation.widgets.control_panel import ControlPanel
+from presentation.widgets.status_bar import VoiceScribeStatusBar
+from presentation.widgets.transcript_view import TranscriptView
+from utils.error_handler import setup_exception_handler
+
+
+def setup_logging(settings: AppSettings):
+    """ロギング設定"""
+    log_level = getattr(logging, settings.logging.log_level.upper(), logging.INFO)
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+    if settings.logging.debug_mode:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger = logging.getLogger(__name__)
+    logger.info("VoiceScribe v2.0 起動")
+    return logger
+
+
+def load_stylesheet() -> str:
+    """スタイルシートを読み込み"""
+    style_path = Path(__file__).parent / "presentation" / "styles" / "theme.qss"
+    if style_path.exists():
+        with open(style_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
 
 def main():
-    config = None
-    recorder = None
-    client = None
-    replacements = None
-    root = None
-    app = None
+    """アプリケーションのメインエントリポイント"""
+    # QApplication 作成
+    app = QApplication(sys.argv)
+    app.setApplicationName("VoiceScribe v2.0")
 
     try:
-        config = load_config()
-        setup_logging(config)
+        # 1. 設定読み込み
+        settings = AppSettings.load()
+        logger = setup_logging(settings)
 
-        debug_logger = setup_debug_logging()
+        # グローバル例外ハンドラ設定
+        setup_exception_handler(app)
 
-        logging.info("アプリケーションを開始します")
+        # スタイルシート適用
+        stylesheet = load_stylesheet()
+        if stylesheet:
+            app.setStyleSheet(stylesheet)
+            logger.info("スタイルシート適用完了")
 
-        initialize_text_processing()
+        # 2. インフラ層初期化
+        logger.info("インフラ層初期化開始")
+        audio_recorder = AudioRecorderWorker(settings=settings.audio)
+        realtime_client = RealtimeTranscriptionClient(
+            api_key=settings.elevenlabs_api_key,
+            settings=settings.realtime_api,
+        )
+        hotkey_manager = GlobalHotkeyManager(settings=settings.hotkeys)
 
-        recorder = AudioRecorder(config)
+        # 3. アプリケーション層初期化
+        logger.info("アプリケーション層初期化開始")
+        text_processor = TextPostProcessor(settings=settings)
+        clipboard_manager = ClipboardManager(settings=settings)
 
-        client = setup_elevenlabs_client()
-        logging.info("ElevenLabs APIクライアントを初期化しました")
+        orchestrator = TranscriptionOrchestrator(
+            recorder=audio_recorder,
+            client=realtime_client,
+            text_processor=text_processor,
+            settings=settings,
+        )
 
-        replacements = load_replacements()
-        root = tk.Tk()
-        app = VoiceInputManager(root, config, recorder, client, replacements, __version__)
+        # 4. プレゼンテーション層初期化
+        logger.info("プレゼンテーション層初期化開始")
+        main_window = MainWindow(settings=settings)
 
-        def safe_close():
-            try:
-                if app:
-                    app.close_application()
-            except Exception as close_error:
-                logging.error(f"終了処理中にエラー: {str(close_error)}")
-                logging.debug(f"終了処理エラー詳細: {traceback.format_exc()}")
+        transcript_view = TranscriptView(max_lines=settings.ui.max_transcript_lines)
+        control_panel = ControlPanel()
+        status_bar = VoiceScribeStatusBar()
 
-        root.protocol("WM_DELETE_WINDOW", safe_close)
-        root.mainloop()
-        logging.info("アプリケーションが正常に終了しました")
+        main_window.set_transcript_view(transcript_view)
+        main_window.set_control_panel(control_panel)
+        main_window.set_status_bar_widget(status_bar)
 
-    except FileNotFoundError as e:
-        error_msg = f"必要なファイルが見つかりません:\n{str(e)}\n\n設定ファイルやリソースファイルを確認してください。"
-        logging.error(error_msg)
-        logging.debug(f"FileNotFoundError詳細: {traceback.format_exc()}")
-        _show_error_dialog(error_msg, "ファイルエラー")
+        # 5. Signal/Slot接続
+        logger.info("Signal/Slot接続開始")
 
-    except ValueError as e:
-        error_msg = f"設定値エラー:\n{str(e)}\n\n設定ファイルや環境変数を確認してください。"
-        logging.error(error_msg)
-        logging.debug(f"ValueError詳細: {traceback.format_exc()}")
-        _show_error_dialog(error_msg, "設定エラー")
+        # オーケストレーター → UI
+        orchestrator.state_changed.connect(control_panel.update_recording_state)
+        orchestrator.state_changed.connect(status_bar.update_recording_state)
+        orchestrator.partial_text_ready.connect(transcript_view.show_partial)
+        orchestrator.committed_text_ready.connect(transcript_view.show_committed)
+        orchestrator.processed_text_ready.connect(clipboard_manager.copy_and_paste)
+        orchestrator.error_occurred.connect(
+            lambda title, msg: QMessageBox.critical(main_window, title, msg)
+        )
+
+        # WebSocketクライアント → ステータスバー
+        realtime_client.connection_state_changed.connect(
+            status_bar.update_connection_state
+        )
+
+        # コントロールパネル → オーケストレーター
+        control_panel.recording_toggled.connect(orchestrator.toggle_recording)
+        control_panel.punctuation_toggled.connect(orchestrator.toggle_punctuation)
+        control_panel.clear_clicked.connect(transcript_view.clear_all)
+        control_panel.settings_clicked.connect(
+            lambda: SettingsDialog(settings, main_window).exec()
+        )
+
+        # ホットキー → オーケストレーター
+        hotkey_manager.toggle_recording_pressed.connect(orchestrator.toggle_recording)
+        hotkey_manager.toggle_punctuation_pressed.connect(
+            orchestrator.toggle_punctuation
+        )
+        hotkey_manager.exit_app_pressed.connect(app.quit)
+        hotkey_manager.reload_replacements_pressed.connect(
+            text_processor.reload_replacements
+        )
+
+        # クリップボード → ステータスバー
+        clipboard_manager.paste_completed.connect(
+            lambda: status_bar.show_message_timed("貼り付け完了")
+        )
+        clipboard_manager.paste_failed.connect(
+            lambda msg: status_bar.show_message_timed(f"貼り付け失敗: {msg}")
+        )
+
+        # ホットキー登録
+        try:
+            hotkey_manager.register_hotkeys()
+            logger.info("ホットキー登録完了")
+        except Exception as e:
+            logger.warning(f"ホットキー登録失敗: {e}")
+
+        # メインウィンドウ表示
+        if not settings.ui.start_minimized:
+            main_window.show()
+
+        logger.info("VoiceScribe v2.0 起動完了")
+
+        # イベントループ開始
+        exit_code = app.exec()
+
+        # クリーンアップ
+        logger.info("アプリケーション終了処理開始")
+        hotkey_manager.unregister_all()
+
+        return exit_code
 
     except Exception as e:
-        error_msg = f"予期せぬエラーが発生しました:\n{str(e)}\n\n詳細は error_log.txt をご確認ください。"
-        logging.error(error_msg)
-        logging.error(f"予期せぬエラーの詳細: {traceback.format_exc()}")
-
-        try:
-            detailed_error = f"""
-=== VoiceScribe エラーレポート ===
-発生日時: {logging.Formatter().formatTime(logging.LogRecord('', 0, '', 0, '', (), None))}
-バージョン: {__version__}
-エラータイプ: {type(e).__name__}
-エラーメッセージ: {str(e)}
-
-=== 初期化状況 ===
-Config: {'初期化済み' if config else '未初期化'}
-Recorder: {'初期化済み' if recorder else '未初期化'}
-Client: {'初期化済み' if client else '未初期化'}
-Replacements: {'初期化済み' if replacements else '未初期化'}
-Root: {'初期化済み' if root else '未初期化'}
-App: {'初期化済み' if app else '未初期化'}
-
-=== スタックトレース ===
-{traceback.format_exc()}
-
-"""
-
-            with open('error_log.txt', 'w', encoding='utf-8') as f:
-                f.write(detailed_error)
-
-            _show_error_dialog(error_msg, "予期せぬエラー")
-
-            try:
-                os.startfile('error_log.txt')
-            except Exception:
-                pass
-
-        except Exception as log_error:
-            final_error = f"エラーログの作成に失敗しました:\n{str(log_error)}\n\n元のエラー:\n{str(e)}"
-            print(final_error, file=sys.stderr)
-            _show_error_dialog(final_error, "重大なエラー")
-
-    finally:
-        try:
-            if app and hasattr(app, 'close_application'):
-                logging.info("最終クリーンアップを実行します")
-                app.close_application()
-            elif app:
-                logging.warning("close_applicationメソッドが見つかりません。代替クリーンアップを実行します")
-                _emergency_cleanup(app)
-        except Exception as cleanup_error:
-            logging.error(f"最終クリーンアップ中にエラー: {str(cleanup_error)}")
-            logging.debug(f"クリーンアップエラー詳細: {traceback.format_exc()}")
-
-
-def _emergency_cleanup(app):
-    try:
-        logging.info("緊急クリーンアップを開始します")
-
-        cleanup_items = [
-            ('recording_controller', getattr(app, 'recording_controller', None)),
-            ('keyboard_handler', getattr(app, 'keyboard_handler', None)),
-            ('notification_manager', getattr(app, 'notification_manager', None))
-        ]
-
-        for name, component in cleanup_items:
-            if component and hasattr(component, 'cleanup'):
-                try:
-                    component.cleanup()
-                    logging.info(f"緊急クリーンアップ完了: {name}")
-                except Exception as e:
-                    logging.error(f"緊急クリーンアップ失敗 ({name}): {str(e)}")
-
-        if hasattr(app, 'master') and app.master:
-            try:
-                app.master.quit()
-                app.master.destroy()
-                logging.info("UI緊急終了完了")
-            except Exception as e:
-                logging.error(f"UI緊急終了中にエラー: {str(e)}")
-
-    except Exception as e:
-        logging.critical(f"緊急クリーンアップ中に重大なエラー: {str(e)}")
-
-
-def _show_error_dialog(message: str, title: str = "エラー"):
-    try:
-        try:
-            root = tk._default_root
-            if root:
-                root.withdraw()
-        except:
-            pass
-
-        error_root = tk.Tk()
-        error_root.withdraw()
-        messagebox.showerror(title, message)
-        error_root.destroy()
-
-    except Exception as dialog_error:
-        print(f"{title}: {message}", file=sys.stderr)
-        print(f"ダイアログ表示エラー: {str(dialog_error)}", file=sys.stderr)
+        logger.error(f"起動エラー: {e}", exc_info=True)
+        QMessageBox.critical(None, "起動エラー", f"アプリケーションの起動に失敗しました:\n{e}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
