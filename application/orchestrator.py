@@ -84,6 +84,8 @@ class TranscriptionOrchestrator(QObject):
 
     def start_recording(self):
         """録音を開始"""
+        import asyncio
+
         logger.info("録音開始要求")
 
         if self._current_state != RecordingState.IDLE:
@@ -96,15 +98,7 @@ class TranscriptionOrchestrator(QObject):
         # 状態遷移: IDLE → CONNECTING
         self._set_state(RecordingState.CONNECTING)
 
-        # WebSocket接続を非同期で開始
-        import asyncio
-
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
+        # WebSocket接続を非同期で開始 (qasyncで設定されたイベントループを使用)
         asyncio.create_task(self._async_start_recording())
 
     async def _async_start_recording(self):
@@ -138,6 +132,8 @@ class TranscriptionOrchestrator(QObject):
 
     def stop_recording(self):
         """録音を停止"""
+        import asyncio
+
         logger.info("録音停止要求")
 
         if self._current_state != RecordingState.RECORDING:
@@ -150,9 +146,7 @@ class TranscriptionOrchestrator(QObject):
         # 録音停止
         self._recorder.stop_recording()
 
-        # WebSocket切断
-        import asyncio
-
+        # WebSocket切断 (qasyncで設定されたイベントループを使用)
         asyncio.create_task(self._async_stop_recording())
 
     async def _async_stop_recording(self):
@@ -195,12 +189,12 @@ class TranscriptionOrchestrator(QObject):
 
     def _on_audio_chunk(self, data: bytes):
         """音声チャンク受信時の処理"""
+        import asyncio
+
         if self._current_state != RecordingState.RECORDING:
             return
 
-        # WebSocketに音声を送信
-        import asyncio
-
+        # WebSocketに音声を送信 (qasyncで設定されたイベントループを使用)
         asyncio.create_task(self._client.send_audio(data))
 
     def _on_partial_transcript(self, transcript: Transcript):

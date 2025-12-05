@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
+import qasync
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from application.clipboard_manager import ClipboardManager
@@ -56,6 +57,10 @@ def main():
     # QApplication 作成
     app = QApplication(sys.argv)
     app.setApplicationName("VoiceScribe v2.0")
+
+    # qasyncイベントループ設定
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
 
     try:
         # 1. 設定読み込み
@@ -161,14 +166,18 @@ def main():
 
         logger.info("VoiceScribe v2.0 起動完了")
 
-        # イベントループ開始
-        exit_code = app.exec()
+        # アプリケーション終了時の処理
+        def cleanup():
+            logger.info("アプリケーション終了処理開始")
+            hotkey_manager.unregister_all()
 
-        # クリーンアップ
-        logger.info("アプリケーション終了処理開始")
-        hotkey_manager.unregister_all()
+        app.aboutToQuit.connect(cleanup)
 
-        return exit_code
+        # イベントループ開始 (qasyncで統合されたイベントループ)
+        with loop:
+            loop.run_forever()
+
+        return 0
 
     except Exception as e:
         logger.error(f"起動エラー: {e}", exc_info=True)
