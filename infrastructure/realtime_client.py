@@ -3,11 +3,12 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Optional
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from PyQt6.QtCore import QObject, pyqtSignal
-from websockets.client import WebSocketClientProtocol
 
 from config.settings import RealtimeApiSettings
 from domain.exceptions import (
@@ -33,20 +34,31 @@ class RealtimeTranscriptionClient(QObject):
         super().__init__()
         self._api_key = api_key
         self._settings = settings
-        self._websocket: Optional[WebSocketClientProtocol] = None
+        self._websocket: Optional[ClientConnection] = None
         self._connection_state = ConnectionState.DISCONNECTED
         self._reconnect_count = 0
         self._is_running = False
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
 
+    def _check_connected(self) -> bool:
+        """接続状態を確認するヘルパーメソッド"""
+        if self._websocket is None:
+            return False
+        
+        try:
+            # websockets 15.x: state プロパティで接続状態を確認
+            # state.name が "OPEN" の場合は接続中
+            return (
+                self._websocket.state.name == "OPEN"
+                and self._connection_state == ConnectionState.CONNECTED
+            )
+        except Exception:
+            return False
+
     @property
     def is_connected(self) -> bool:
         """接続状態を返す"""
-        return (
-            self._websocket is not None
-            and not self._websocket.closed
-            and self._connection_state == ConnectionState.CONNECTED
-        )
+        return self._check_connected()
 
     @property
     def connection_state(self) -> ConnectionState:
@@ -62,7 +74,7 @@ class RealtimeTranscriptionClient(QObject):
 
     async def connect(self) -> bool:
         """WebSocket接続を確立"""
-        if self.is_connected:
+        if self._check_connected():
             logger.warning("既に接続されています")
             return True
 
@@ -113,7 +125,7 @@ class RealtimeTranscriptionClient(QObject):
 
     async def send_audio(self, data: bytes):
         """音声データを送信"""
-        if not self.is_connected:
+        if not self._check_connected():
             raise WebSocketConnectionError("WebSocketが接続されていません")
 
         try:
@@ -133,22 +145,25 @@ class RealtimeTranscriptionClient(QObject):
 
     async def _send_loop(self):
         """音声データ送信ループ"""
-        while self._is_running and self.is_connected:
+        while self._is_running and self._check_connected():
             try:
                 data = await asyncio.wait_for(
                     self._audio_queue.get(), timeout=0.1
                 )
-                if self._websocket:
+                if self._websocket and self._check_connected():
                     await self._websocket.send(data)
             except asyncio.TimeoutError:
                 continue
+            except websockets.ConnectionClosed:
+                logger.warning("送信中に接続が閉じられました")
+                break
             except Exception as e:
                 logger.error(f"送信ループエラー: {e}")
                 break
 
     async def receive_loop(self):
         """文字起こし結果受信ループ"""
-        if not self.is_connected:
+        if not self._check_connected():
             raise WebSocketConnectionError("WebSocketが接続されていません")
 
         self._is_running = True
@@ -184,8 +199,6 @@ class RealtimeTranscriptionClient(QObject):
 
     async def _handle_message(self, data: dict):
         """受信メッセージを処理"""
-        from datetime import datetime
-
         message_type = data.get("type")
 
         if message_type == "partial":
