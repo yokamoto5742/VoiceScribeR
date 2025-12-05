@@ -202,7 +202,7 @@ class RealtimeTranscriptionClient(QObject):
                     logger.error(f"メッセージ処理エラー: {e}")
 
         except websockets.ConnectionClosed as e:
-            logger.warning(f"WebSocket接続が切断されました: {e}")
+            logger.warning(f"WebSocket接続が切断されました: code={e.code}, reason={e.reason}")
             if self._is_running:
                 await self._handle_reconnect()
 
@@ -217,7 +217,16 @@ class RealtimeTranscriptionClient(QObject):
                 await send_task
             except asyncio.CancelledError:
                 pass
-            logger.info("受信ループ終了")
+            # 接続終了の理由を確認
+            if self._websocket:
+                try:
+                    close_code = self._websocket.close_code
+                    close_reason = self._websocket.close_reason
+                    logger.info(f"受信ループ終了: close_code={close_code}, close_reason={close_reason}")
+                except Exception:
+                    logger.info("受信ループ終了: 接続情報取得不可")
+            else:
+                logger.info("受信ループ終了: WebSocket=None")
 
     async def _handle_message(self, data: dict):
         """受信メッセージを処理"""
