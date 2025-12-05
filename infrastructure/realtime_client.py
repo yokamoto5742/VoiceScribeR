@@ -73,7 +73,7 @@ class RealtimeTranscriptionClient(QObject):
             headers = {"xi-api-key": self._api_key}
 
             logger.info(f"WebSocket接続開始: {self._settings.model}")
-            self._websocket = await websockets.connect(url, extra_headers=headers)
+            self._websocket = await websockets.connect(url, additional_headers=headers)
 
             self._set_connection_state(ConnectionState.CONNECTED)
             self._reconnect_count = 0
