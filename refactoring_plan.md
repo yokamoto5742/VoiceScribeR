@@ -38,7 +38,6 @@ Phase 5: 統合・最適化    ━━━━━━━━━━━━━━━━�
 ```
 □ 新規ディレクトリ構造を作成
 □ __init__.py ファイルを各パッケージに配置
-□ pyproject.toml または requirements.txt を更新
 ```
 
 **成果物:**
@@ -59,35 +58,6 @@ voice_scribe_v2/
 │   └── __init__.py
 └── config/
     └── __init__.py
-```
-
-### Step 1.2: 依存関係の更新
-
-**タスク:**
-```
-□ PyQt6 を追加
-□ 不要なパッケージを削除（pyinstaller関連は後回し）
-□ 開発用パッケージを分離（pytest, pyright等）
-```
-
-**requirements.txt（本番用）:**
-```
-PyQt6>=6.6.0
-elevenlabs>=2.25.0
-websockets>=15.0.0
-pyaudio>=0.2.14
-keyboard>=0.13.5
-pyperclip>=1.9.0
-python-dotenv>=1.1.0
-```
-
-**requirements-dev.txt（開発用）:**
-```
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-pytest-qt>=4.4.0
-pytest-cov>=6.0.0
-pyright>=1.1.400
 ```
 
 ### Step 1.3: 設定管理の刷新
