@@ -5,8 +5,8 @@ import tkinter as tk
 import traceback
 from tkinter import messagebox
 
-from app import __version__
-from app.main_window import VoiceInputManager
+from voice_scribe_v1.app import __version__
+from voice_scribe_v1.app import VoiceInputManager
 from external_service.elevenlabs_api import setup_elevenlabs_client
 from service.audio_recorder import AudioRecorder
 from service.text_processing import initialize_text_processing, load_replacements
