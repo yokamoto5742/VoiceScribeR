@@ -45,14 +45,17 @@ class RealtimeTranscriptionClient(QObject):
         if self._websocket is None:
             return False
         
+        if self._connection_state != ConnectionState.CONNECTED:
+            return False
+
         try:
             # websockets 15.x: state プロパティで接続状態を確認
-            # state.name が "OPEN" の場合は接続中
-            return (
-                self._websocket.state.name == "OPEN"
-                and self._connection_state == ConnectionState.CONNECTED
-            )
-        except Exception:
+            state = self._websocket.state
+            # State列挙型の値をチェック（OPEN = 1）
+            is_open = state.value == 1 or str(state.name) == "OPEN"
+            return is_open
+        except Exception as e:
+            logger.debug(f"接続状態チェック中のエラー: {e}")
             return False
 
     @property
@@ -113,6 +116,7 @@ class RealtimeTranscriptionClient(QObject):
 
     async def disconnect(self):
         """WebSocket接続を切断"""
+        self._is_running = False
         if self._websocket:
             try:
                 await self._websocket.close()
@@ -124,9 +128,11 @@ class RealtimeTranscriptionClient(QObject):
                 self._set_connection_state(ConnectionState.DISCONNECTED)
 
     async def send_audio(self, data: bytes):
-        """音声データを送信"""
+        """音声データを送信（未接続時はスキップ）"""
+        # 未接続時は例外を投げずにスキップ
         if not self._check_connected():
-            raise WebSocketConnectionError("WebSocketが接続されていません")
+            logger.debug("WebSocket未接続のため音声データをスキップ")
+            return
 
         try:
             # バックプレッシャー制御
@@ -140,18 +146,24 @@ class RealtimeTranscriptionClient(QObject):
             await self._audio_queue.put(data)
 
         except Exception as e:
-            logger.error(f"音声データ送信エラー: {e}")
-            raise TranscriptionError(f"音声送信失敗: {e}")
+            logger.error(f"音声データキューイングエラー: {e}")
 
     async def _send_loop(self):
         """音声データ送信ループ"""
-        while self._is_running and self._check_connected():
+        logger.debug("送信ループ開始")
+        while self._is_running:
             try:
+                # キューからデータを取得
                 data = await asyncio.wait_for(
                     self._audio_queue.get(), timeout=0.1
                 )
+
+                # 接続確認してから送信
                 if self._websocket and self._check_connected():
                     await self._websocket.send(data)
+                else:
+                    logger.debug("送信時にWebSocket未接続")
+
             except asyncio.TimeoutError:
                 continue
             except websockets.ConnectionClosed:
@@ -159,20 +171,28 @@ class RealtimeTranscriptionClient(QObject):
                 break
             except Exception as e:
                 logger.error(f"送信ループエラー: {e}")
-                break
+                # エラーでも継続
+                continue
+
+        logger.debug("送信ループ終了")
 
     async def receive_loop(self):
         """文字起こし結果受信ループ"""
         if not self._check_connected():
-            raise WebSocketConnectionError("WebSocketが接続されていません")
+            logger.error("receive_loop: WebSocketが接続されていません")
+            return
 
         self._is_running = True
+        logger.info("受信ループ開始")
 
         # 送信ループを別タスクで起動
         send_task = asyncio.create_task(self._send_loop())
 
         try:
             async for message in self._websocket:
+                if not self._is_running:
+                    break
+
                 try:
                     data = json.loads(message)
                     await self._handle_message(data)
@@ -183,7 +203,8 @@ class RealtimeTranscriptionClient(QObject):
 
         except websockets.ConnectionClosed as e:
             logger.warning(f"WebSocket接続が切断されました: {e}")
-            await self._handle_reconnect()
+            if self._is_running:
+                await self._handle_reconnect()
 
         except Exception as e:
             logger.error(f"受信ループエラー: {e}", exc_info=True)
@@ -196,6 +217,7 @@ class RealtimeTranscriptionClient(QObject):
                 await send_task
             except asyncio.CancelledError:
                 pass
+            logger.info("受信ループ終了")
 
     async def _handle_message(self, data: dict):
         """受信メッセージを処理"""
