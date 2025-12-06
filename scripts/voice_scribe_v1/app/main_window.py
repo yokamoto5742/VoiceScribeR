@@ -5,7 +5,7 @@ import time
 import tkinter as tk
 from typing import Any, Dict
 
-from voice_scribe_v1.app.ui_components import UIComponents
+from scripts.voice_scribe_v1.app.ui_components import UIComponents
 from service.keyboard_handler import KeyboardHandler
 from service.notification import NotificationManager
 from service.recording_controller import RecordingController
