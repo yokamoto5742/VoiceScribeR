@@ -1,13 +1,11 @@
 """文字起こしオーケストレーター - 全体制御"""
 
 import logging
-from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from config.settings import AppSettings
-from domain.exceptions import StateTransitionError
-from domain.models import RecordingState, Transcript, TranscriptType
+from domain.models import RecordingState, Transcript
 
 logger = logging.getLogger(__name__)
 

@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import sys
+from datetime import datetime, timedelta
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import qasync
@@ -22,23 +24,79 @@ from utils.error_handler import setup_exception_handler
 
 
 def setup_logging(settings: AppSettings):
-    """ロギング設定"""
+    """ログシステムをセットアップ（ファイル出力とローテーション機能付き）"""
     log_level = getattr(logging, settings.logging.log_level.upper(), logging.INFO)
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    # ログディレクトリ作成
+    log_dir = settings.paths.log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
 
+    # ログファイルパス
+    log_file = log_dir / "VoiceScribe.log"
+
+    # TimedRotatingFileHandlerでログローテーション
+    file_handler = TimedRotatingFileHandler(
+        filename=str(log_file),
+        when='midnight',
+        backupCount=settings.logging.log_retention_days,
+        encoding='utf-8'
+    )
+    file_handler.suffix = "%Y-%m-%d.log"
+
+    # フォーマッター設定
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
+    # コンソールハンドラー
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.WARNING)  # WARNING以上のみコンソール出力
+
+    # ルートロガー設定
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    # デバッグモード時は全てのログをコンソール出力
     if settings.logging.debug_mode:
-        logging.getLogger().setLevel(logging.DEBUG)
+        console_handler.setLevel(logging.DEBUG)
+        root_logger.setLevel(logging.DEBUG)
+
+    # 古いログファイルをクリーンアップ
+    _cleanup_old_logs(log_dir, settings.logging.log_retention_days)
 
     logger = logging.getLogger(__name__)
+    logger.info(f"ログシステムが初期化されました: {log_file}")
     logger.info("VoiceScribe v2.0 起動")
     return logger
+
+
+def _cleanup_old_logs(log_dir: Path, retention_days: int):
+    """古いログファイルを削除"""
+    try:
+        now = datetime.now()
+        main_log_file = "VoiceScribe.log"
+        rotated_log_pattern = r"VoiceScribe\.log\.\d{4}-\d{2}-\d{2}\.log$"
+
+        import re
+        deleted_count = 0
+        for log_file in log_dir.glob("*.log"):
+            if log_file.name != main_log_file and re.match(rotated_log_pattern, log_file.name):
+                try:
+                    file_modified = datetime.fromtimestamp(log_file.stat().st_mtime)
+                    if now - file_modified >= timedelta(days=retention_days):
+                        log_file.unlink()
+                        logging.info(f"古いログファイルを削除しました: {log_file.name}")
+                        deleted_count += 1
+                except OSError as e:
+                    logging.error(f"ログファイルの削除中にエラーが発生しました {log_file.name}: {str(e)}")
+
+        if deleted_count > 0:
+            logging.info(f"合計 {deleted_count} 個の古いログファイルを削除しました")
+
+    except Exception as e:
+        logging.error(f"ログクリーンアップ処理中にエラーが発生しました: {str(e)}")
 
 
 def load_stylesheet() -> str:
