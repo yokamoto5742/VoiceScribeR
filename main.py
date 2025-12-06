@@ -1,5 +1,3 @@
-"""VoiceScribe v2.0 メインエントリポイント"""
-
 import asyncio
 import logging
 import sys
