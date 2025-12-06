@@ -1,5 +1,3 @@
-"""ElevenLabs Realtime API WebSocketクライアント"""
-
 import asyncio
 import json
 import logging
