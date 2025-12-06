@@ -31,6 +31,9 @@ class RealtimeApiSettings(BaseSettings):
     initial_reconnect_delay: float = Field(
         default=1.0, description="初回再接続遅延 (秒)"
     )
+    connection_timeout: float = Field(
+        default=10.0, description="WebSocket接続タイムアウト (秒)"
+    )
 
     model_config = SettingsConfigDict(env_prefix="REALTIME_API_")
 

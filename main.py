@@ -45,7 +45,7 @@ def load_stylesheet() -> str:
     """スタイルシートを読み込み"""
     style_path = Path(__file__).parent / "presentation" / "styles" / "theme.qss"
     if style_path.exists():
-        with open(style_path, "r", encoding="utf-8") as f:
+        with open(style_path, encoding="utf-8") as f:
             return f.read()
     return ""
 

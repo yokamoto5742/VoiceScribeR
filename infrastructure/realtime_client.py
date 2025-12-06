@@ -44,16 +44,13 @@ class RealtimeTranscriptionClient(QObject):
         """接続状態を確認するヘルパーメソッド"""
         if self._websocket is None:
             return False
-        
+
         if self._connection_state != ConnectionState.CONNECTED:
             return False
 
         try:
-            # websockets 15.x: state プロパティで接続状態を確認
-            state = self._websocket.state
-            # State列挙型の値をチェック（OPEN = 1）
-            is_open = state.value == 1 or str(state.name) == "OPEN"
-            return is_open
+            # websockets 15.x: open プロパティで接続状態を確認
+            return self._websocket.open
         except Exception as e:
             logger.debug(f"接続状態チェック中のエラー: {e}")
             return False
@@ -75,11 +72,32 @@ class RealtimeTranscriptionClient(QObject):
             self.connection_state_changed.emit(state)
             logger.info(f"接続状態変更: {state.name}")
 
+    def _validate_api_key(self) -> bool:
+        """APIキーの基本的な検証"""
+        if not self._api_key:
+            logger.error("APIキーが設定されていません")
+            return False
+
+        if len(self._api_key.strip()) < 10:
+            logger.error("APIキーが短すぎます")
+            return False
+
+        return True
+
     async def connect(self) -> bool:
         """WebSocket接続を確立"""
         if self._check_connected():
             logger.warning("既に接続されています")
             return True
+
+        # APIキー検証
+        if not self._validate_api_key():
+            error = WebSocketAuthenticationError(
+                "APIキーが無効です。.envファイルを確認してください"
+            )
+            self.error_occurred.emit(error)
+            self._set_connection_state(ConnectionState.FAILED)
+            raise error
 
         self._set_connection_state(ConnectionState.CONNECTING)
 
@@ -88,12 +106,24 @@ class RealtimeTranscriptionClient(QObject):
             headers = {"xi-api-key": self._api_key}
 
             logger.info(f"WebSocket接続開始: {self._settings.model}")
-            self._websocket = await websockets.connect(url, additional_headers=headers)
+            self._websocket = await asyncio.wait_for(
+                websockets.connect(url, additional_headers=headers),
+                timeout=self._settings.connection_timeout,
+            )
 
             self._set_connection_state(ConnectionState.CONNECTED)
             self._reconnect_count = 0
             logger.info("WebSocket接続成功")
             return True
+
+        except asyncio.TimeoutError:
+            error = WebSocketConnectionError(
+                f"接続タイムアウト ({self._settings.connection_timeout}秒)"
+            )
+            logger.error("WebSocket接続がタイムアウトしました")
+            self.error_occurred.emit(error)
+            self._set_connection_state(ConnectionState.FAILED)
+            return False
 
         except websockets.InvalidStatusCode as e:
             if e.status_code == 401:
@@ -253,6 +283,14 @@ class RealtimeTranscriptionClient(QObject):
             )
             self.committed_transcript_received.emit(transcript)
             logger.debug(f"確定結果: {text}")
+
+        elif message_type == "error":
+            # エラーメッセージ
+            error_msg = data.get("message", "Unknown error")
+            logger.error(f"サーバーからのエラー: {error_msg}")
+            error = TranscriptionError(f"サーバーエラー: {error_msg}")
+            self.error_occurred.emit(error)
+            self._set_connection_state(ConnectionState.FAILED)
 
         else:
             logger.debug(f"未知のメッセージタイプ: {message_type}")
